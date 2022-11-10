@@ -32,6 +32,7 @@ pub use esp_hal_common::{
     Rwdt,
     Serial,
     UsbSerialJtag,
+    sha
 };
 
 pub use self::gpio::IO;

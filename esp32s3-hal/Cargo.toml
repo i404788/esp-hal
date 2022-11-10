@@ -53,6 +53,10 @@ smartled    = ["esp-hal-common/smartled"]
 ufmt        = ["esp-hal-common/ufmt"]
 vectored    = ["esp-hal-common/vectored"]
 
+
+[profile.dev.package.xtensa-lx-rt]
+opt-level = 'z'
+
 [[example]]
 name              = "hello_rgb"
 required-features = ["smartled"]
