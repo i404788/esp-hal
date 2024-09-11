@@ -56,6 +56,7 @@ ssd1306             = "0.8.4"
 static_cell         = { version = "2.1.0", features = ["nightly"] }
 usb-device          = "0.3.2"
 usbd-serial         = "0.2.2"
+usbh                = { git = "https://github.com/i404788/usbh.git"}
 
 [features]
 esp32   = ["esp-hal/esp32",   "esp-backtrace/esp32",   "esp-hal-embassy?/esp32",   "esp-println/esp32",   "esp-storage?/esp32",   "esp-wifi?/esp32",   "esp-hal-smartled/esp32"]
@@ -69,6 +70,8 @@ esp32s3 = ["esp-hal/esp32s3", "esp-backtrace/esp32s3", "esp-hal-embassy?/esp32s3
 esp-wifi = ["dep:esp-wifi"]
 
 async = ["esp-hal/async", "embassy-usb"]
+
+usb-host = ["esp-hal/usb-host"]
 
 embedded-hal-02 = ["esp-hal/embedded-hal-02"]
 embedded-hal = ["esp-hal/embedded-hal"]

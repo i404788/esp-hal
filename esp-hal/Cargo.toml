@@ -26,7 +26,8 @@ document-features        = "0.2.10"
 embassy-futures          = { version = "0.1.1", optional = true }
 embassy-sync             = { version = "0.6.0", optional = true }
 embassy-usb-driver       = { version = "0.1.0", optional = true }
-embassy-usb-synopsys-otg = { version = "0.1.0", optional = true }
+# embassy-usb-synopsys-otg = { version = "0.1.0", optional = true }
+embassy-usb-synopsys-otg = { git = "https://github.com/i404788/embassy.git", rev = "d72e535be", optional = true}
 embedded-can             = { version = "0.4.1", optional = true }
 embedded-hal-02          = { version = "0.2.7", optional = true, features = ["unproven"], package = "embedded-hal" }
 embedded-hal             = { version = "1.0.0", optional = true }
@@ -49,6 +50,7 @@ usb-device               = { version = "0.3.2", optional = true }
 rand_core                = "0.6.4"
 ufmt-write               = { version = "0.1.0", optional = true }
 xtensa-lx                = { version = "0.9.0", optional = true }
+usbh                     = { git = "https://github.com/i404788/usbh.git", optional = true}
 
 # IMPORTANT:
 # Each supported device MUST have its PAC included below along with a
@@ -60,6 +62,7 @@ esp32c6 = { version = "0.15.0", features = ["critical-section", "rt"], optional 
 esp32h2 = { version = "0.11.0", features = ["critical-section", "rt"], optional = true }
 esp32s2 = { version = "0.23.0", features = ["critical-section", "rt"], optional = true }
 esp32s3 = { version = "0.27.0", features = ["critical-section", "rt"], optional = true }
+
 
 [target.'cfg(target_arch = "riscv32")'.dependencies]
 esp-riscv-rt = { version = "0.9.0", path = "../esp-riscv-rt" }
@@ -75,13 +78,14 @@ esp-metadata = { version = "0.2.0", path = "../esp-metadata" }
 serde        = { version = "1.0.204", features = ["derive"] }
 
 [features]
-default = ["embedded-hal"]
+default = ["embedded-hal", "esp32s3", "usb-host"]
 
 riscv  = ["dep:riscv",     "critical-section/restore-state-u8"]
 xtensa = ["dep:xtensa-lx", "critical-section/restore-state-u32"]
 
 bluetooth = []
 
+usb-host = ['usbh', "usb-device", "esp-synopsys-usb-otg", "embassy-usb-synopsys-otg"]
 usb-otg = ["esp-synopsys-usb-otg", "usb-device"]
 
 ## Enable debug features in the HAL (used for development).
