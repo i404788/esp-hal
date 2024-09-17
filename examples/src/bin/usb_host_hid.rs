@@ -19,15 +19,16 @@ use esp_hal::{
     otg_fs::{usbhost::UsbHostBus, Usb},
     peripherals::Peripherals,
     prelude::*,
+    system::SystemControl,
+    cpu_control::{CpuControl},
+    clock::{ClockControl, CpuClock},
 };
 use esp_println::println;
 use usbh::{
     driver::{
-        kbd::{KbdDriver, KbdEvent, KbdLed},
+        kbd::{KbdDriver, KbdError, KbdEvent, KbdLed},
         log::{EventMask, LogDriver},
-    },
-    PollResult,
-    UsbHost,
+    }, types::DeviceAddress, ControlError, PollResult, UsbHost
 };
 
 #[global_allocator]
@@ -46,8 +47,12 @@ pub fn init_heap(allocator: &esp_alloc::EspHeap) {
 #[entry]
 fn main() -> ! {
     init_heap(&ALLOCATOR);
-
     let peripherals = Peripherals::take();
+    let system = SystemControl::new(peripherals.SYSTEM);
+    let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
+    
+
+    
     esp_println::logger::init_logger(log::LevelFilter::Debug);
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
@@ -59,7 +64,7 @@ fn main() -> ! {
     let mut log_driver = LogDriver::new(EventMask::all());
     let mut kbd_driver = KbdDriver::<2>::new();
 
-    let mut num_state: bool = false;
+    let mut num_state: bool = true;
 
     loop {
         match usbhost.poll(&mut [&mut log_driver, &mut kbd_driver]) {
@@ -67,12 +72,12 @@ fn main() -> ! {
                 continue;
             }
             v => {
-                println!("usbh poll: {:?}", v);
+                // println!("usbh poll: {:?}", v);
             }
         }
 
-        println!("Usb state: {:?}", usbhost.get_state());
 
+        let mut keyboard_addr: Option<DeviceAddress> = None;
 
         match kbd_driver.take_event() {
             None => {}
@@ -83,7 +88,9 @@ fn main() -> ! {
                 println!("new dev: {:?}", dev_addr);
                 // Keyboard with address dev_addr added
                 kbd_driver.set_idle(dev_addr, 0, &mut usbhost).ok().unwrap();
+                keyboard_addr.replace(dev_addr);
             }
+            
             Some(KbdEvent::DeviceRemoved(dev_addr)) => {
                 // Keyboard with address dev_addr removed
                 println!("removed dev: {:?}", dev_addr);
@@ -92,7 +99,6 @@ fn main() -> ! {
                 // Input on keyboard
 
                 println!("input: {:?}", report);
-
                 // toggle Num lock LED when NumLock key is pressed
                 if report.pressed_keys().any(|key| key == 83) {
                     num_state = !num_state;
@@ -103,7 +109,6 @@ fn main() -> ! {
                     }
                     kbd_driver
                         .set_led(dev_addr, KbdLed::NumLock, num_state, &mut usbhost)
-                        .ok()
                         .unwrap();
                 }
             }

@@ -72,6 +72,7 @@ esp-wifi = ["dep:esp-wifi"]
 async = ["esp-hal/async", "embassy-usb"]
 
 usb-host = ["esp-hal/usb-host"]
+usbh-fifo = ["esp-hal/usbh-fifo"]
 
 embedded-hal-02 = ["esp-hal/embedded-hal-02"]
 embedded-hal = ["esp-hal/embedded-hal"]

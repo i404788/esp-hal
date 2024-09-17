@@ -99,6 +99,26 @@ impl<E: EndianessConverter> AlignmentHelper<E> {
         U32_ALIGN_SIZE
     }
 
+    // Writes src to dst_ptr repeatedly in u32 chunks, buffering any remaining data
+    //  which can be handled with `flush_to`
+    #[allow(dead_code)]
+    pub fn volatile_fifo_write(&mut self, src: &[u8], dst_ptr: *mut u32) -> bool {
+        if !src.is_empty() {
+            let mut iterator = src.chunks_exact(U32_ALIGN_SIZE);
+            while let Some(v) = iterator.next() {
+                unsafe {
+                    dst_ptr
+                        .write_volatile(E::u32_from_bytes(v.try_into().unwrap()));
+                }
+            }
+
+            let remaining = iterator.remainder();
+            self.buf[..remaining.len()].copy_from_slice(remaining);
+            self.buf_fill = remaining.len();
+        }
+        return self.buf_fill != 0;
+    }
+
     // This function will write any remaining buffer to dst and return the
     // amount of *bytes* written (0 means no write). If the buffer is not
     // aligned to the size of the register destination, it will append the '0'

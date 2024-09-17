@@ -135,6 +135,8 @@ unsafe impl<'d> UsbPeripheral for Usb<'d> {
 pub mod usbhost {
     extern crate alloc;
 
+    use core::ops::Mul;
+
     use embassy_usb_synopsys_otg::
         otg_v1::{vals::{Dpid, Dspd, Eptyp, FrameListLen, Pfivl}, Otg}
     ;
@@ -142,7 +144,7 @@ pub mod usbhost {
     use usbh::{bus::{Error, Event, HostBus, InterruptPipe}, types::ConnectionSpeed};
 
     use super::*;
-    use crate::Cpu;
+    use crate::{reg_access::AlignmentHelper, Cpu};
 
     // Up to a total of 4KB according to ESP32S3 TRM; however the fifo depth specified is 256*u32=1024=1KB
     // Here also specified in words (u32s)
@@ -161,31 +163,6 @@ pub mod usbhost {
     const TX_FIFO_SIZE: usize = TX_FIFO_WORDS*4; // NOTE: periodic not used yet but equivalent to this
     const PIPE_COUNT: usize = 8;
     const FRAME_LIST_LEN: FrameListLen = FrameListLen::LEN32;
-
-    // struct PipeDescriptor {
-    //     // TODO: generic or const size
-    //     buffer: core::cell::UnsafeCell<core::mem::MaybeUninit<[u32; 64]>>,
-    // }
-
-    // impl PipeDescriptor {
-    //     fn get_buffer_addr(&mut self) -> *mut u8 {
-    //         self.buffer.get_mut().as_mut_ptr() as *mut u8
-    //     }
-
-    //     fn get_mut(&mut self) -> &mut [u8] { 
-    //         unsafe { 
-    //             let len = self.buffer.get_mut().assume_init_ref().len();
-    //             core::slice::from_raw_parts_mut(self.get_buffer_addr(), len*4) 
-    //         }
-    //     }
-
-    //     fn get(&self) -> &[u8] {
-    //         unsafe { 
-    //             let buf = (*self.buffer.get()).assume_init();
-    //             core::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()*4) 
-    //         }
-    //     }
-    // }
 
     fn dma_alloc_buffer<T>(length: usize, align: usize) -> &'static mut [T] {
         let size = core::mem::size_of::<T>();
@@ -206,6 +183,7 @@ pub mod usbhost {
     }
 
     /// Expected to be 8 bytes
+    #[cfg(feature = "usbh-sg")]
     #[repr(C)]
     struct QtdEntry {
         buffer_status: u32,
@@ -213,17 +191,17 @@ pub mod usbhost {
     }
 
     /// Shared DMA buffers used by the USB Host driver
+    #[cfg(feature = "usbh-sg")]
     struct UsbHostBuffers {
-        // FIXME: frame_list doesn't seem to be yet assigned to the right address
         frame_list: &'static mut [u32]
     }
-
+    #[cfg(feature = "usbh-sg")]
     impl UsbHostBuffers {
         pub fn new_alloc() -> Self {
             UsbHostBuffers { frame_list: dma_alloc_buffer(FRAME_LIST_LEN.as_value() as usize, 512) }
         }
     }
-
+    #[cfg(feature = "usbh-sg")]
     impl Drop for UsbHostBuffers {
         fn drop(&mut self) {
             unsafe {
@@ -261,15 +239,41 @@ pub mod usbhost {
         }
     }
 
+    #[cfg(feature = "usbh-sg")]
+    compile_error!("USBH Scatter/Gather is not fully implemented, and *will not* work");
+
     // Channel-specific buffers used by USB Host driver in Buffer-DMA mode
     pub struct UsbHostChannelBuffers {
+        // In order to implement interrupt pipes in fifo or buffer-dma, we'll need to keep track of intervals ourselves
+        //  luckily we have a handy frame reference in hfnum. So we can store the interval & calculated next hfnum for trigger (w/ wrapping)
+        interrupt_interval: (u16, u16, bool),
         buffer: &'static mut [u8],
     }
 
     impl UsbHostChannelBuffers {
         pub fn new_alloc(buffer_size: usize) -> Self {
-            // TODO: unsure if 512 align is required here
-            UsbHostChannelBuffers { buffer: dma_alloc_buffer(buffer_size, 512) }
+            // [CherryUSB] 32-bit aligned
+            UsbHostChannelBuffers { 
+                // (interval, next_hfnum, paused)
+                interrupt_interval: (0, 0, false),
+                buffer: dma_alloc_buffer(buffer_size, 4) 
+            }
+        }
+
+        pub fn set_interval(&mut self, frame_interval: u16) {
+            self.interrupt_interval.0 = frame_interval
+        }
+
+        pub fn check_and_reset_interval(&mut self, hfnum: u16) -> bool {
+            if self.interrupt_interval.0 == 0 || self.interrupt_interval.2 {
+                return false; // No interval set
+            }
+
+            if self.interrupt_interval.1.wrapping_sub(hfnum) & 0x3fff > self.interrupt_interval.0 {
+                self.interrupt_interval.1 = hfnum;
+                return true;
+            }
+            false
         }
     }
 
@@ -282,7 +286,7 @@ pub mod usbhost {
     impl Drop for UsbHostChannelBuffers {
         fn drop(&mut self) {
             unsafe {
-                dma_dealloc_buffer(self.buffer, 512);
+                dma_dealloc_buffer(self.buffer, 4);
             }
         }
     }
@@ -290,12 +294,19 @@ pub mod usbhost {
     pub struct UsbHostBus<'d> {
         regs: Otg,
         allocated_pipes: u16,
+
+        #[cfg(feature = "usbh-fifo")]
+        rxfifo_buf: [u8; RX_FIFO_SIZE],
+        #[cfg(feature = "usbh-fifo")]
+        rxfifo_usage: usize,
+
         txfifo_buf: [u8; TX_FIFO_SIZE],
         txfifo_usage: usize,
 
         dev_conn: bool,
 
         channel_buffers: [UsbHostChannelBuffers; PIPE_COUNT],
+        #[cfg(feature = "usbh-sg")]
         buffers: UsbHostBuffers,
         _usb0: PeripheralRef<'d, peripherals::USB0>,
     }
@@ -382,16 +393,20 @@ pub mod usbhost {
                 _usb0: usb0.into_ref(),
                 regs,
                 
-                // rxfifo_buf: [0u8; RX_FIFO_SIZE],
-                // rxfifo_usage: 0,
+                #[cfg(feature = "usbh-fifo")]
+                rxfifo_buf: [0u8; RX_FIFO_SIZE],
+                #[cfg(feature = "usbh-fifo")]
+                rxfifo_usage: 0,
+                
                 txfifo_buf: [0u8; TX_FIFO_SIZE],
                 txfifo_usage: 0,
 
                 dev_conn: false,
             
                 channel_buffers: Default::default(),
+                #[cfg(feature = "usbh-sg")]
                 buffers: UsbHostBuffers::new_alloc(),
-                allocated_pipes: 1, // Control pipe reserved
+                allocated_pipes: 3, // Control pipe & first data pipe reserved
             }
         }
 
@@ -402,11 +417,7 @@ pub mod usbhost {
                     // TODO: check for not powered state
 
                     // Disable all channel interrupts
-                    self.regs.haintmsk().write(|w| w.0 = !0);
-                    self.regs.gintmsk().modify(|w| {
-                        w.set_prtim(true);
-                        w.set_hcim(true);
-                    });
+                    // self.regs.haintmsk().write(|w| w.0 = !0);
                     
                     // Power port
                     self.regs.hprt().modify(|w| {
@@ -423,48 +434,58 @@ pub mod usbhost {
 
         fn set_frameschedule(&mut self, channel: u8, interval: u8, offset: u8) {
             // Convert interval (ms) to interval_frame (fp/ms)
-            const FRAMES_PER_MS: u32 = 12_000_000 / 1000 / 8 / 64;
-            let mut interval_frame: u32 = (interval as u32 * FRAMES_PER_MS).max(1);
-            let mut offset_frame: u32 = offset as u32 * FRAMES_PER_MS;
-
-            // let interval_frame_list : u32 = ep_char->periodic.interval;
-            // let offset_frame_list : u32= ep_char->periodic.offset;
             
-            const IS_HS: bool = false; // defined per channel
-            // Periodic Frame List works with USB frames. For HS endpoints we must divide interval[microframes] by 8 to get interval[frames]
-            if IS_HS {
-                interval_frame /= 8;
-                offset_frame /= 8;
-            }
+            // const FRAMES_PER_MS: u32 = 1_500_000 / 1000 / 8 / 64;  // LS
+            // const FRAMES_PER_MS: u32 = 12_000_000 / 1000 / 8 / 64; // FS
+            // let mut interval_frame: u32 = (interval as u32 * FRAMES_PER_MS).max(1);
+            // let mut offset_frame: u32 = offset as u32 * FRAMES_PER_MS;
 
-            // Interval in Periodic Frame List must be power of 2.
-            // This is not a HW restriction. It is just a lot easier to schedule channels like this.
-            let frame_list_len = FRAME_LIST_LEN.as_value() as u32;
-            if interval_frame > frame_list_len {
-                interval_frame = frame_list_len;
+            #[cfg(not(feature = "usbh-sg"))]
+            {
+                // We'll have to do it ourselves
+                // We could add the offset here by setting the initial next_hfnum, but that seems quite useless to me
+                self.channel_buffers[channel as usize].set_interval(interval as u16);
             }
-            // Quantize to lower power of 2 (i.e. 68 => 64, 42 => 32, etc)
-            interval_frame = 1 << (u32::BITS - interval_frame.leading_zeros() - 1);
+            
+            #[cfg(feature = "usbh-sg")]
+            {
+                // In Scatter/Gather mode we can auto-schedule
+                const IS_HS: bool = false; // defined per channel
+                // Periodic Frame List works with USB frames. For HS endpoints we must divide interval[microframes] by 8 to get interval[frames]
+                if IS_HS {
+                    interval_frame /= 8;
+                    offset_frame /= 8;
+                }
 
-            // Schedule the channel in the frame list
-            for i in (0..frame_list_len).step_by(interval_frame as usize) {
-                let index = (offset_frame + i) % frame_list_len;
-                self.buffers.frame_list[index as usize] |= 1 << channel;
-            }
+                // Interval in Periodic Frame List must be power of 2.
+                // This is not a HW restriction. It is just a lot easier to schedule channels like this.
+                let frame_list_len = FRAME_LIST_LEN.as_value() as u32;
+                if interval_frame > frame_list_len {
+                    interval_frame = frame_list_len;
+                }
+                // Quantize to lower power of 2 (i.e. 68 => 64, 42 => 32, etc)
+                interval_frame = 1 << (u32::BITS - interval_frame.leading_zeros() - 1);
 
-            // For HS endpoints we must write to sched_info field of HCTSIZ register to schedule microframes
-            if IS_HS {
-                // USB-OTG databook: Table 5-47 (only for HS)
-                let sched_info = match interval_frame {
-                    // 1 token per 8 microframes
-                    8..=u32::MAX => 0b00000001 << (offset_frame % 8),
-                    4..8 => 0b00010001 << (offset_frame % 4),
-                    2..4 => 0b01010101 << (offset_frame % 2),
-                    _ => 0xffu32,
-                };
-                self.regs.hctsiz(channel as usize).modify(|w| {
-                    w.set_schedinfo(sched_info as u8);
-                });
+                // Schedule the channel in the frame list
+                for i in (0..frame_list_len).step_by(interval_frame as usize) {
+                    let index = (offset_frame + i) % frame_list_len;
+                    self.buffers.frame_list[index as usize] |= 1 << channel;
+                }
+
+                // For HS endpoints we must write to sched_info field of HCTSIZ register to schedule microframes
+                if IS_HS {
+                    // USB-OTG databook: Table 5-47 (only for HS)
+                    let sched_info = match interval_frame {
+                        // 1 token per 8 microframes
+                        8..=u32::MAX => 0b00000001 << (offset_frame % 8),
+                        4..8 => 0b00010001 << (offset_frame % 4),
+                        2..4 => 0b01010101 << (offset_frame % 2),
+                        _ => 0xffu32,
+                    };
+                    self.regs.hctsiz(channel as usize).modify(|w| {
+                        w.set_schedinfo(sched_info as u8);
+                    });
+                }
             }
         }
 
@@ -504,7 +525,7 @@ pub mod usbhost {
             self.regs.grstctl().write(|w| {
                 w.set_rxfflsh(true);
                 w.set_txfflsh(true);
-                w.set_txfnum(0x1);
+                w.set_txfnum(0b10000); // Flush all tx [RM0390]
             });
             loop {
                 let x = self.regs.grstctl().read();
@@ -512,46 +533,54 @@ pub mod usbhost {
                     break;
                 }
             }
-            self.regs.grstctl().write(|w| {
-                w.set_txfflsh(true);
-                w.set_txfnum(0x0);
-            });
-            while self.regs.grstctl().read().txfflsh() {}
             
         }
 
         fn read_tx(&mut self, data_len: usize, pid: Dpid, epnum: u8, pipe_ref: usize) {
             debug_assert!(pipe_ref <= PIPE_COUNT);
-            debug!("read_tx: {}", data_len);
+            debug!("read_tx: {} pid={}, epnum={}, pipe_ref={}", data_len, pid as u8, epnum, pipe_ref);
 
-            let max_packet_size: usize = RX_FIFO_SIZE;
-            self.regs.hcchar(pipe_ref).write(|w| {
+            // NOTE: max_packet_size is critical to get right (otherwise it may not send the read packet at all)
+            let max_packet_size: usize = 8; // For CTRL_EP LS=8, FS=64 // TX_FIFO_SIZE;
+            // let max_packet_size: usize = RX_FIFO_SIZE;
+
+            let intx = epnum & 0x80 != 0x80;
+            self.regs.hcchar(pipe_ref).modify(|w| {
                 w.set_lsdev(false); // LS unsupported
-                w.set_epnum(epnum); // Endpoint nr
+                w.set_epnum(epnum & 0x7F); // Endpoint nr
                 w.set_mpsiz(max_packet_size as u16); // Packet size
-                w.set_epdir(true); // ENDPOINT_TYPE; IN
-                w.set_mcnt(1); // Packets per frame
+                w.set_epdir(intx); // ENDPOINT_TYPE; IN
+                // w.set_mcnt(1); // Packets per frame
             });
 
             let transfer_size: u32 = data_len as u32; // sizeof(SetupPacket)
-            self.regs.hctsiz(pipe_ref).write(|w| {
-                w.set_xfrsiz(transfer_size); // Transfer size
-                w.set_dpid(pid.into());
+            self.regs.hctsiz(pipe_ref).modify(|w| {
                 w.set_pktcnt(transfer_size.div_ceil(max_packet_size as u32).max(1) as u16);
+                w.set_xfrsiz(
+                    if !intx {
+                        w.pktcnt() as u32  * max_packet_size as u32
+                    } else {
+                        transfer_size
+                    });
+                w.set_dpid(pid.into());
+                w.set_doping(false);
             });
 
-            self.regs.hcsplt(pipe_ref).write_value(0); 
+            let hctsize = self.regs.hctsiz(pipe_ref).read();
 
-
-            assert!(data_len <= self.channel_buffers[pipe_ref].buffer.len(), "Expected transfer_size to be smaller than the transfer");
+            // debug!("Sending: xfrsize: {}, max_packet_size: {}, epnum: {}, pktcnt: {}, pipe: {}", hctsize.xfrsiz(), max_packet_size, epnum, hctsize.pktcnt(), pipe_ref);
 
             // NOTE: Qtd is scatter/gather dma, while this is buffer-dma
-            // FIXME: unsure which of hcdma or hcdmab is the actual address; just try both
             #[cfg(not(feature = "usbh-fifo"))]
             {
+                assert!(data_len <= self.channel_buffers[pipe_ref].buffer.len(), "Expected transfer_size to be smaller than the transfer");
                 self.regs.hcdma(pipe_ref).write(|w| w.0 = self.channel_buffers[pipe_ref].buffer.as_ptr() as u32);
-                self.regs.hcdmab(pipe_ref).write_value(self.channel_buffers[pipe_ref].buffer.as_ptr() as u32);
             }
+
+            // let nptxstat = self.regs.hnptxsts().read();
+            // debug!("nptx: words_avail: {}, q_avail: {}", nptxstat.nptxfsav(), nptxstat.nptqxsav());
+            // let grxstat = self.regs.grxstsr().read();
+            // debug!("rx stat={}, epnum: {}", grxstat.pktstsh() as u8, grxstat.epnum());
             
             // if IN direction, adjust RX fifo to be eq or larger than requested data
             #[cfg(not(feature = "usbh-dfifo"))]
@@ -582,56 +611,74 @@ pub mod usbhost {
                 self.regs.grxfsiz().modify(|w| w.set_rxfd(sz.max(w.rxfd())));
             }
 
-            // Start: dwc_channel_start_transaction(chan, req);
-            // Clear interrupts
-            self.regs.hcint(pipe_ref).write(|w| w.0 = 0xffffffff);
-            self.regs.hcintmsk(pipe_ref).write(|w| w.0 = 0);
 
-            let frame_nr = self.regs.hfnum().read().frnum();
-            self.regs.hcchar(pipe_ref).write(|w| {
-                // Set odd-frame and enable channel
-                w.set_oddfrm(frame_nr & 1 == 0);
-                w.set_chena(true);
-            });
-
-            // Re-enable channel halt
-            self.regs.hcintmsk(pipe_ref).write(|w| {
-                w.set_chhm(true);
+            self.regs.gintmsk().modify(|w| {
+                w.set_hcim(false);
             });
 
             // Enable channel interrupts
-            self.regs.haintmsk().modify(|w| {
-                w.set_haintm(w.haintm() | (1 << pipe_ref));
+            // self.regs.hcintmsk(pipe_ref).write(|w| {
+            //     w.0 = 0x7ff; // Enable all
+            //     // w.set_chhm(true);
+            // });
+
+            // let hccar = self.regs.hcchar(pipe_ref).read();
+            // debug!("[pre] hccar, chena: {}, chdis: {}", hccar.chena(), hccar.chdis());
+            self.regs.hcchar(pipe_ref).modify(|w| {
+                // Set odd-frame seems only required for periodic/isochr [RM0390]
+                let frame_nr = self.regs.hfnum().read().frnum();
+                w.set_oddfrm(frame_nr & 1 == 0);
+
+                w.set_chena(true);
+                w.set_chdis(false);
             });
+            // let nptxstat = self.regs.hnptxsts().read();
+            // debug!("nptx: words_avail: {}, q_avail: {}", nptxstat.nptxfsav(), nptxstat.nptqxsav());
+            // let grxstat = self.regs.grxstsr().read();
+            // debug!("rx stat={}, epnum: {}", grxstat.pktstsh() as u8, grxstat.epnum());
         }
 
         // SAFETY: in dma mode (not(usbh-fifo)): data slice needs to exists at least as long as UsbHostBus itself; no local slices
-        unsafe fn write_tx(&self, data: &[u8], pid: Dpid, epnum: u8, pipe_ref: usize) {
+        unsafe fn write_tx(&self, data: &[u8], pid: Dpid, epnum: u8, pipe_ref: usize, data_size: u16) {
             debug_assert!(pipe_ref <= PIPE_COUNT);
             debug_assert!(data.len() < TX_FIFO_SIZE);
             debug!("write_tx: {:?} pid: {}, epnum: {}, pipe: {}", data, pid as u8, epnum, pipe_ref);
 
-            let max_packet_size: usize = TX_FIFO_SIZE;
+            let max_packet_size: usize = 8; // For CTRL_EP LS=8, FS=64 // TX_FIFO_SIZE;
 
             // NOTE: ep0 supports both directions but only one packet at a time, so multiple writes might be needed to finish a transfer
             // NOTE: usbh only supports single-channel operation for non-pipe data in/out it seems
             // No endpoint (control xfer)
-            self.regs.hcchar(pipe_ref).write(|w| {
-                w.set_lsdev(false); // LS unsupported
-                w.set_epnum(epnum); // Endpoint nr
+            const LS: bool = false; // TODO: follow CherryUSBs method
+            let intx = epnum & 0x80 != 0x80;
+            self.regs.hcchar(pipe_ref).modify(|w: &mut embassy_usb_synopsys_otg::otg_v1::regs::Hcchar| {
+                // LSDEV only if port speed is FS/HS but device is LS (i.e. a hub)
+                w.set_lsdev(LS);
+
+                // NOTE: DO NOT SET EPNUM (it should be done by `set_recipient``)
+                // w.set_epnum(epnum & 0x7F); // Endpoint nr
                 w.set_mpsiz(max_packet_size as u16); // Packet size
                 w.set_epdir(false); // ENDPOINT_TYPE; OUT
-                w.set_mcnt(1); // Packets per frame
             });
 
             let transfer_size: u32 = data.len() as u32; // sizeof(SetupPacket)
             self.regs.hctsiz(pipe_ref).modify(|w| {
-                w.set_xfrsiz(transfer_size); // Transfer size
-                w.set_dpid(pid.into());
                 w.set_pktcnt(transfer_size.div_ceil(max_packet_size as u32).max(1) as u16);
+                // w.set_xfrsiz(transfer_size as u32);
+                w.set_xfrsiz(if !intx {
+                    w.pktcnt() as u32  * max_packet_size as u32
+                } else {
+                    transfer_size as u32 // Transfer size
+                });
+                w.set_dpid(pid.into());
+                w.set_doping(false);
             });
 
-            self.regs.hcsplt(pipe_ref).write_value(0); 
+            let nptxstat = self.regs.hnptxsts().read();
+            debug!("nptx: words_avail: {}, q_avail: {}", nptxstat.nptxfsav(), nptxstat.nptqxsav());
+
+            debug!("Sending: xfrsize: {}, max_packet_size: {}, lsdev: {}, epnum: {}, pktcnt: {}, pipe: {}", transfer_size, max_packet_size, LS, epnum, transfer_size.div_ceil(max_packet_size as u32).max(1), pipe_ref);
+
             // Unsure how to use split_control, seems like it's always enabled for LS/FS in xinu but requires emulating a hub :(
             //  https://github.com/xinu-os/xinu/blob/30777a80f2ebdc47b854f9434bfed6e3569edd2e/system/platforms/arm-rpi/usb_dwc_hcd.c#L959
             // self.regs.hcsplt(pipe_ref).write(|w| {
@@ -639,53 +686,54 @@ pub mod usbhost {
             //     w.
             // });
 
+            self.regs.gintmsk().modify(|w| {
+                w.set_hcim(false);
+            });
+            // Enable channel interrupts
+
+            // FIXME: haintmsk doesn't work as expected (it should prevent hcim but doesn't in either u32::MAX or u32::MIN), haint itself always triggers
+            // self.regs.haintmsk().modify(|w| {
+            //     // w.0 = u32::MAX;
+            //     // w.set_haintm(w.haintm() | (1 << pipe_ref));
+            // });
+            // Re-enable channel halt
+            self.regs.hcintmsk(pipe_ref).write(|w| {
+                w.0 = 0x7ff; // Enable all
+                // w.set_chhm(true);
+            });
+
             // Write all data to fifo or set dma address
             #[cfg(not(feature = "usbh-fifo"))]
             {
                 self.regs.hcdma(pipe_ref).write(|w| w.0 = data.as_ptr() as u32);
-                self.regs.hcdmab(pipe_ref).write_value(data.as_ptr() as u32);
+                // self.regs.hcdmab(pipe_ref).write_value(data.as_ptr() as u32);
             }
 
             #[cfg(feature = "usbh-fifo")]
             {
-                let data_iter = self.txfifo_buf.chunks_exact(4);
-                for word in data_iter {
-                    self.regs.fifo(pipe_ref).write_value(regs::Fifo(u32::from_ne_bytes(word.try_into().unwrap())));
-                }
-
-                let remainder = data_iter.remainder();
-                if remainder.len() > 0 {
-                    let mut remainder_buf: [u8; 4] = [0u8; 4];
-                    remainder_buf[..remainder.len()].copy_from_slice(remainder);
-                    self.regs.fifo(pipe_ref).write_value(regs::Fifo(u32::from_ne_bytes(remainder_buf)));
+                let mut helper = AlignmentHelper::default();
+                let fifo_ptr = self.regs.fifo(pipe_ref).as_ptr() as *mut u32;
+                if helper.volatile_fifo_write(data, fifo_ptr) {
+                    helper.flush_to(fifo_ptr, 0);
                 }
             }
 
+            let nptxstat = self.regs.hnptxsts().read();
+            debug!("[post] nptx: words_avail: {}, q_avail: {}", nptxstat.nptxfsav(), nptxstat.nptqxsav());
+
             // Start: dwc_channel_start_transaction(chan, req);
             // Clear interrupts
-            self.regs.hcint(pipe_ref).write(|w| w.0 = 0xffffffff);
-            self.regs.hcintmsk(pipe_ref).write(|w| w.0 = 0);
+            // self.regs.hcint(pipe_ref).write(|w| w.0 = 0xffffffff);
 
-            let frame_nr = self.regs.hfnum().read().frnum();
-            self.regs.hcchar(pipe_ref).write(|w| {
-                // Set odd-frame and enable channel
+            
+            // let frame_nr = self.regs.hfnum().read().frnum();
+            self.regs.hcchar(pipe_ref).modify(|w| {
+                // Set odd-frame seems only required for periodic/isochr [RM0390]
+                let frame_nr = self.regs.hfnum().read().frnum();
                 w.set_oddfrm(frame_nr & 1 == 0);
+
                 w.set_chena(true);
-            });
-
-            // Re-enable channel halt
-            self.regs.hcintmsk(pipe_ref).write(|w| {
-                w.set_chhm(true);
-            });
-
-            // Enable channel interrupts
-            self.regs.haintmsk().write(|w| w.set_haintm(0xffffu16));
-            // self.regs.haintmsk().modify(|w| {
-            //     w.set_haintm(w.haintm() | (1 << pipe_ref));
-            // });
-
-            self.regs.gintmsk().modify(|w| {
-                w.set_hcim(true);
+                w.set_chdis(false);
             });
         }
 
@@ -716,13 +764,24 @@ pub mod usbhost {
             });
             let hprt = self.regs.hprt().read();
             self.regs.hfir().modify(|w| {
-                w.set_rldctrl(false);
+                w.set_rldctrl(true);
                 w.set_frivl(match hprt.pspd() {
                     1 => 48000,
                     2 => 6000,
                     _ => unreachable!()
                 })
             });
+            let hcfg = self.regs.hcfg().read();
+            if hcfg.fslspcs() != hprt.pspd() {
+                self.regs.hcfg().modify(|w| {
+                    // [CherryUSB] Align clock for Full-speed/Low-speed
+                    w.set_fslspcs(hprt.pspd());
+                });
+                // Required after fslspcs change [RM0390]
+                self.reset_bus();
+            }
+
+            self.init_fifo();
         }
 
         fn release_channel(&mut self, pipe: InterruptPipe) {
@@ -805,36 +864,34 @@ pub mod usbhost {
     /// This mapping is not disimilar to RP2040 impl however buffers are now 'double-backed' so data is first stored on the 
     ///     Heap/Stack and then transferred into the TX FIFO; or on poll() transferred from FIFO into Heap/Stack (at which point Event::InterruptPipe can be given)
     impl<'d> HostBus for UsbHostBus<'d> {
-        fn reset_controller(&mut self) {
-
-            self.regs.dcfg().write(|w| {
-                w.set_pfivl(Pfivl::FRAME_INTERVAL_80);
-                w.set_dad(Dspd::FULL_SPEED_INTERNAL as u8);
-            });
-            
+        fn reset_controller(&mut self) {            
             // Set host config
-            self.regs.gusbcfg().write(|w| {
+            self.regs.gusbcfg().modify(|w| {
                 w.set_fhmod(true); // Force host mode
                 w.set_fdmod(false); // Deassert device mode
                 w.set_srpcap(false);
                 w.set_hnpcap(false);
                 // Enable internal full-speed PHY
                 w.set_physel(true);
-                w.set_trdt(5); // Maximum 
+                w.set_trdt(5); // Maximum  
                 w.set_tocal(7); // Maximum timeout calibration 
             });
 
-            self.regs.gccfg_v1().modify(|w| {
-                w.set_pwrdwn(true); // PwrDown inverted
-            });
+            // self.regs.hcfg().write(|w| {
+            //     w.set_fslss(false); // Max speed default
+            // });
+            
+            // self.regs.gccfg_v1().modify(|w| {
+            //     w.set_pwrdwn(true); // PwrDown inverted
+            // });
 
-            self.regs.gccfg_v1().modify(|w| {
-                const VBUSDETECT: bool = false;
-                w.set_novbussens(!VBUSDETECT);
-                w.set_vbusasen(false);
-                w.set_vbusbsen(VBUSDETECT);
-                w.set_sofouten(false);
-            });
+            // self.regs.gccfg_v1().modify(|w| {
+            //     const VBUSDETECT: bool = false;
+            //     w.set_novbussens(!VBUSDETECT);
+            //     w.set_vbusafsen(false);
+            //     w.set_vbusbsen(VBUSDETECT);
+            //     w.set_sofouten(false);
+            // });
 
             // FIXME: should this really be before host config?
             // Perform core soft-reset
@@ -848,32 +905,34 @@ pub mod usbhost {
             self.allocated_pipes = 1;
             self.txfifo_usage = 0;
 
-            self.regs.pcgcctl().modify(|w| {
-                // Disable power down
-                w.set_stppclk(false);
-            });
+            // self.regs.pcgcctl().modify(|w| {
+            //     // Disable power down
+            //     w.set_stppclk(false);
+            // });
 
             self.init_fifo();
 
-            // self.regs.gintmsk().write_value(embassy_usb_synopsys_otg::otg_v1::regs::Gintmsk(0x0));
-            // TODO: not getting any interrupts check esp-idf for interrupt enable switches
+            // self.regs.hprt().write(|w| {
+            //     w.set_pspd(Dspd::FULL_SPEED_INTERNAL as u8);
+            //     w.set_pena(false);
+            // });
             
-            self.regs.hprt().write(|w| {
-                w.set_pspd(Dspd::FULL_SPEED_INTERNAL as u8);
-                w.set_pena(false);
-            });
             self.regs.gahbcfg().write(|w| {
+                #[cfg(not(feature = "usbh-fifo"))]
                 w.set_dmaen(true);
-                w.set_hbstlen(0);
+                w.set_hbstlen(0x7);
             });
 
             // Enable main host interrupts
             self.regs.gintmsk().write(|w| {
-                w.set_discint(true);
-                w.set_usbrst(true);
-                w.set_hcim(true);
-                w.set_prtim(true);
-                w.set_enumdnem(true);
+                w.0 = u32::MAX;
+                w.set_discint(false);
+                w.set_usbrst(false);
+                w.set_hcim(false);
+                w.set_mmism(false);
+                w.set_otgint(false);
+                w.set_prtim(false);
+                w.set_enumdnem(false);
             });
             // Clear interrupts
             self.regs.gintsts().write(|w| w.0 = 0);
@@ -897,12 +956,12 @@ pub mod usbhost {
                 w.set_prst(true);
             });
 
-            crate::rom::ets_delay_us(30_000);
+            crate::rom::ets_delay_us(15_000);
             self.regs.hprt().modify(|w| {
                 w.0 &= !HPRT_W1C_MASK;
                 w.set_prst(false);
             });
-            crate::rom::ets_delay_us(30_000);
+            crate::rom::ets_delay_us(15_000);
 
             let hprt = self.regs.hprt().read();
             if !hprt.pena() && !hprt.pcdet() {
@@ -910,10 +969,7 @@ pub mod usbhost {
             }
 
             self.dev_conn = false;
-
-            // FIXME: need to re-init fifo, framelist & periodic sched
-
-            //  According to xinu it needs to be cleared after 60s (https://github.com/xinu-os/xinu/blob/30777a80f2ebdc47b854f9434bfed6e3569edd2e/system/platforms/arm-rpi/usb_dwc_hcd.c#L332)
+            // According to xinu it needs to be cleared after 60s (https://github.com/xinu-os/xinu/blob/30777a80f2ebdc47b854f9434bfed6e3569edd2e/system/platforms/arm-rpi/usb_dwc_hcd.c#L332)
             // According to ERZ32, only 10 ms is needed; and USB_HPRT.PRTENCHNG interrupt detects finish (https://www.silabs.com/documents/public/reference-manuals/EZR32WG-RM.pdf)
         }
 
@@ -932,18 +988,19 @@ pub mod usbhost {
             transfer_type: usbh::types::TransferType,
         ) {
 
+            debug!("[otg_fs:usbh]: set recipient: tt={} dev_addr={:?}, ep={}", transfer_type as u8, dev_addr, endpoint);
+
             let channel = match transfer_type {
                 usbh::types::TransferType::Control => 0,
                 _ => 1 // TODO: pop from available
             };
 
             // NOTE: TRM says 8 channels available; first pipe is control packets, remaining 7 are bulk/interrupt/isochronuous
-            self.regs.hcchar(channel).write(|w| { 
+            self.regs.hcchar(channel).modify(|w| { 
                 w.set_dad(dev_addr.map(u8::from).unwrap_or(0));
                 w.set_epnum(endpoint);
                 w.set_eptyp((transfer_type as u8).into());
-                
-                // w.set_chena(true); // Enable channel
+                w.set_chena(false);
             });
         }
 
@@ -953,28 +1010,27 @@ pub mod usbhost {
             let mut data = [0u8; 8];
             data[0] = setup.request_type;
             data[1] = setup.request;
-            // TODO: is NE correct?
-            data[2..4].copy_from_slice(&setup.value.to_ne_bytes());
-            data[4..6].copy_from_slice(&setup.index.to_ne_bytes());
-            data[6..8].copy_from_slice(&setup.length.to_ne_bytes());
+            data[2..4].copy_from_slice(&setup.value.to_le_bytes());
+            data[4..6].copy_from_slice(&setup.index.to_le_bytes());
+            data[6..8].copy_from_slice(&setup.length.to_le_bytes());
 
             #[cfg(not(feature = "usbh-fifo"))]
             {
                 self.channel_buffers[0].buffer[..8].copy_from_slice(&data);
 
                 // SAFETY: dma_buf lives as long as Self
-                unsafe { self.write_tx(&self.channel_buffers[0].buffer[..8], Dpid::MDATA, 0,0) }
+                unsafe { self.write_tx(&self.channel_buffers[0].buffer[..8], Dpid::MDATA, setup.request_type,0, setup.length) }
             }
             
             #[cfg(feature = "usbh-fifo")]
             // SAFETY: with usbh-fifo data gets copied
-            unsafe {self.write_tx(&data, Dpid::MDATA, 0,0) };
+            unsafe {self.write_tx(&data, Dpid::MDATA, setup.request_type, 0, setup.length) };
         }
 
         fn write_data_in(&mut self, length: u16, pid: bool) {
             debug!("write_data_in: {} pid={}", length, pid);
             let pid = if pid { Dpid::DATA1 } else { Dpid::DATA0 };
-            self.read_tx(length as usize,  pid, 0, 0);
+            self.read_tx(length as usize, pid, 0, 0);
         }
 
         fn prepare_data_out(&mut self, data: &[u8]) {
@@ -994,7 +1050,7 @@ pub mod usbhost {
             const CNTRL_CH: u8 = 0;
 
             // SAFETY: txfifo_buf lives as long as Self
-            unsafe { self.write_tx(&self.txfifo_buf[..self.txfifo_usage], Dpid::DATA1, CNTRL_CH, 0); }
+            unsafe { self.write_tx(&self.txfifo_buf[..self.txfifo_usage], Dpid::DATA1, CNTRL_CH, 0, self.txfifo_usage as u16); }
             self.txfifo_usage = 0;
         }
 
@@ -1003,15 +1059,14 @@ pub mod usbhost {
             let mut intr = self.regs.gintsts().read();
             let hprt: embassy_usb_synopsys_otg::otg_v1::regs::Hprt = self.regs.hprt().read();
 
-            if intr.hcint() || intr.discint() || hprt.pcdet() || hprt.penchng() || hprt.pocchng() {
-                self.regs.gintsts().write(|_|{});
+            if intr.discint() || hprt.pcdet() || hprt.penchng() || hprt.pocchng() {
+                self.regs.gintsts().write(|w|{ w.set_discint(true); });
 
                 self.regs.hprt().modify(|w| {
                     w.0 &= !HPRT_W1C_MASK;
-                    w.set_pcdet(false);
-                    w.set_pcsts(false);
-                    w.set_penchng(false);
-                    w.set_pocchng(false);
+                    w.set_pcdet(true);
+                    w.set_penchng(true);
+                    w.set_pocchng(true);
                 }); // Clear interrupts of hrpt
 
                 debug!("[hprtint]: detected: {} (status: {}), discint: {}", hprt.pcdet(), hprt.pcsts(), intr.discint());
@@ -1048,7 +1103,7 @@ pub mod usbhost {
 
                 // NOTE: this should be hprt.pcdet() but it doesn't detect reliably (may have to do with `pena`)
                 // NOTE: usbh expects Attached(_) after each reset
-                if hprt.pcsts() && !self.dev_conn{
+                if hprt.pcsts() && !self.dev_conn {
                     crate::rom::ets_delay_us(30_000);
                     let hprt = self.regs.hprt().read();
                     if hprt.pcsts() {
@@ -1069,6 +1124,8 @@ pub mod usbhost {
                 }
             }
 
+            // TODO: self.regs.gotgint().read().dbcdne() for re-connect
+
             // Unsure if this is the correct one (also have non-interrupt port resume)
             if intr.wkupint() {
                 debug!("wakeup, why don't you put on a little makup");
@@ -1077,42 +1134,70 @@ pub mod usbhost {
                 return Some(Event::Resume);
             }
 
-            let gccfv1 = self.regs.gccfg_v1().read();
-            let hfnum = self.regs.hfnum().read();
-            debug!("sofen: {}, hfnum: {}", gccfv1.sofouten(), hfnum.frnum());
-            self.regs.gccfg_v1().modify(|w| w.set_sofouten(true));
-            // Notify SOF was sent
-            if intr.sof() {
-                debug!("[sof]");
-                intr.set_sof(true);
-                self.regs.gintsts().write_value(intr);
-                return Some(Event::Sof);
-            }
+            let chintr = self.regs.haint().read().haint();
 
-            if intr.hcint() {
-                debug!("[hcint]");
+            if intr.hcint() || chintr != 0 {
+                debug!("[hcint]: haint: {} hcint: {}", chintr, intr.hcint());
+                // panic!("What have we done!");
                 // Channel has pending interrupt, handle them each individually
                 let mut chintr = self.regs.haint().read().haint();
                 while chintr != 0 {
-                    let idx = chintr.leading_zeros() as usize;
+                    let idx = chintr.trailing_zeros() as usize;
+                    trace!("Checking channel: {}", idx);
+                    debug!("hc{}: {}", idx, self.regs.hcint(idx).read().0);
 
                     let mut hcintr = self.regs.hcint(idx).read();
                     if hcintr.stall() {
                         hcintr.set_stall(true);
                         self.regs.hcint(idx).write_value(hcintr);
+                        debug!("Stalled");
                         return Some(Event::Stall);
                     }
     
                     if hcintr.txerr() || hcintr.bberr() {
                         // hcintr.dterr() should only for OUT
+                        debug!("Errored (probably a configuration error): tx={} bb={}", hcintr.txerr(), hcintr.bberr());
                         hcintr.set_txerr(true);
                         hcintr.set_bberr(true);
                         self.regs.hcint(idx).write_value(hcintr);
+                        // Disable channel
+                        self.regs.hcchar(idx).modify(|w| {
+                            w.set_chena(true);
+                            w.set_chdis(true);
+                        });
                         return Some(Event::Error(Error::Crc));
                     }
 
+                    if hcintr.frmor(){
+                        debug!("Framme overrun");
+                        self.channel_buffers[idx].interrupt_interval.2 = false;
+                        self.regs.hcint(idx).write(|w| w.set_frmor(true));
+                    }
+
+                    if hcintr.dterr() {
+                        debug!("Data toggle error");
+                        self.channel_buffers[idx].interrupt_interval.2 = false;
+                        self.regs.hcint(idx).write(|w| w.set_dterr(true));
+                    }
+
+                    if hcintr.chh() {
+                        // Channel halted
+                        // TODO[CherryUSB]: apparently Control endpoints do something when at INDATA state?
+                        trace!("Halted");
+                        self.regs.hcint(idx).write(|w| w.set_chh(true));
+                    }
+
+                    if hcintr.nak() {
+                        // Interrupt Pipe, We be polling
+                        // * Pipe, we be waiting
+                        debug!("Got NAK");
+                        self.channel_buffers[idx].interrupt_interval.2 = false;
+                        self.regs.hcint(idx).write(|w| w.set_nak(true));
+                    }
+
+
                     // Xinu auto-assumes halt if no error should we not check                    
-                    assert!(hcintr.chh(), "Expected channel to be halted; maybe some unknown error occurred?");
+                    // assert!(hcintr.chh(), "Expected channel to be halted; maybe some unknown error occurred?");
                     
                     // DMA-case: if ch.dir == IN; copy DMA
 
@@ -1121,30 +1206,61 @@ pub mod usbhost {
 
                     // TODO: for split_control or if we use transfer_size lower than desired we'll need to catch this in the request https://github.com/xinu-os/xinu/blob/30777a80f2ebdc47b854f9434bfed6e3569edd2e/system/platforms/arm-rpi/usb_dwc_hcd.c#L1314C16-L1314C38
                     
-                    // TODO: validate edge(chanptr->transfer.packet_count == 0): Event::TransferComplete
                     if hcintr.xfrc() {
-                        if idx == 0 {
-                            // Channel 0: control
+                        // Transfer was completed
+                        assert!(hcintr.ack(), "Didn't get ACK, but transfer was complete");
+                        
+                        self.regs.hcchar(idx).modify(|w| {
+                            // Disable channel for next trx
+                            w.set_chena(false);
+                            w.set_chdis(false);
+                        });
 
+                        if idx == 0 {
+                            debug!("[xfrc] transaction complete");
+                            // Channel 0: control
                             // From xinu it seems like hctsize is updated from both sides but I'm unsure (this would make sense for dpid behaviour as well)
                             // assert!(self.regs.hctsiz(idx).read().pktcnt() == 0, "Expected all packets to be transmitted");
                             hcintr.set_xfrc(true);
+                            hcintr.set_ack(true);
                             self.regs.hcint(idx).write_value(hcintr);
                             return Some(Event::TransComplete);
                         } else {
                             // Channel 1..16: interrupt pipes (assumed?)
+                            hcintr.set_ack(true);
                             hcintr.set_xfrc(true);
                             self.regs.hcint(idx).write_value(hcintr);
-                            // TODO: pull data here or in recevied_data?
+
+                            // CherryUSB and other say to flip when halted + xfrc but it seems like the core does that already itself
+                            // let hctsiz = self.regs.hctsiz(idx).read();
+                            // debug!("Before flip: {}", hctsiz.dpid());
+                            // self.regs.hctsiz(idx).modify(|w| {
+                            //     // Dpid is flipped per URB so we wouldn't ever see DATA1?
+                            //     let pid = match Dpid::from_bits(w.dpid()) {
+                            //         Dpid::DATA0 => Dpid::DATA1,
+                            //         Dpid::DATA2 => Dpid::DATA1,
+                            //         _ => Dpid::DATA0,
+                            //     };
+                            //     w.set_dpid(pid as u8);
+                            // });
+                            // let hctsiz = self.regs.hctsiz(idx).read();
+                            // debug!("After flip: {}", hctsiz.dpid());
+
+                            // TODO(feature=fifo): pull data here or in recevied_data?
                             return Some(Event::InterruptPipe(idx as u8));
                         }
+                    }
+
+                    if hcintr.ack() {
+                        debug!("Something went wrong? ACK without xfrc");
+                        self.regs.hcint(idx).write(|w|w.set_ack(true));
                     }
 
                     chintr ^= 1 << idx as u16;
                 }
             }
-
             // NOTE: there is no CRC error in dwc2, it probably fall under babble/transaction/excess_transaction/data_toggle/etc error :shrug:
+
 
             if intr.discint() {
                 debug!("[discint]: disconnect");
@@ -1179,7 +1295,7 @@ pub mod usbhost {
             }
 
             if intr.cidschg() {
-                debug!("[cidschg]: Connector ID status change");
+                // debug!("[cidschg]: Connector ID status change");
             }
 
             if intr.datafsusp() {
@@ -1190,7 +1306,63 @@ pub mod usbhost {
                 debug!("[eopf]: End of period interval frame");
             }
 
-            debug!("[intr]: {}", intr.0);
+            #[cfg(feature = "usbh-fifo")]
+            if intr.rxflvl() {
+                let rxinfo = self.regs.grxstsp().read();
+                let bytes = rxinfo.bcnt();
+                debug!("[rxflvl]: RX FIFO contains some data, pkststsh: {}, bytes: {}, pid: {}, words: {}", 
+                            rxinfo.pktstsh().to_bits(), bytes, rxinfo.dpid() as u8, bytes.div_ceil(4));
+                
+                // In order to continue reading we need to clear the last packet of the RX FIFO
+                for _ in 0..bytes.div_ceil(4) {
+                    debug!("rx word: {}", self.regs.fifo(0).read().0);
+                }
+            }
+
+            for ch in 1..PIPE_COUNT {
+                let hfnum = self.regs.hfnum().read();
+                if self.channel_buffers[ch].check_and_reset_interval(hfnum.frnum()) {
+                    trace!("interrupt-pipe: ch={}, interval={}, @{}", ch, self.channel_buffers[ch].interrupt_interval.0, hfnum.frnum());
+                    
+        
+                    // FIXME: xfersiz is not safe to use as len, probably need to store the intr pipe cfg
+                    let hctsiz = self.regs.hctsiz(ch).read();
+                    self.read_tx(8 as usize, Dpid::from_bits(hctsiz.dpid()), 1, ch);
+                    self.channel_buffers[ch].interrupt_interval.2 = true;
+                    // self.regs.hcchar(ch).modify(|w| {
+                    //     w.set_epnum(1 & 0x7F); // Endpoint nr
+                    //     w.set_mpsiz(8 as u16); // Packet size
+                    //     w.set_epdir(true); // ENDPOINT_TYPE; IN
+                    // });
+                    // // Channel supposed to get a new interrupt, enable channel to send interrupt
+                    // self.regs.hctsiz(ch).modify(|w| {
+                    //     w.set_dpid(pid.into());
+                    // });
+                    
+                    // // // HCDMA gets auto-incremented, so reset it before each tx just in case
+                    // self.regs.hcdma(ch).write(|w| w.0 = self.channel_buffers[ch].buffer.as_ptr() as u32 );
+                    // self.regs.gintmsk().modify(|w| {
+                    //     w.set_hcim(false);
+                    // });
+                    // ets_delay_us(50_000);
+                    // self.regs.hcchar(ch).modify(|w| {
+                    //     w.set_chena(true);
+                    //     w.set_chdis(false);
+                    // });
+                }
+            }
+
+            self.regs.gccfg_v1().modify(|w| w.set_sofouten(true));
+            // Notify SOF was sent
+            if intr.sof() {
+                trace!("[sof]");
+                intr.set_sof(true);
+                self.regs.gintsts().write_value(intr);
+                return Some(Event::Sof);
+            }
+
+
+            trace!("[intr]: {}", intr.0);
             // if intr.0 != 0 {
             //     debug!("[intr]: {}", intr.0);
             //     // Write of eq value should clear
@@ -1202,9 +1374,8 @@ pub mod usbhost {
         }
 
         fn pipe_continue(&mut self, pipe_index: u8) {
-            // FIXME: unsure exactly how this is expected to be handled, 
-            //  but given that we are talking about interrupt pipes maybe disabling the channel or unscheduling of the channel would be enough?
-            // self.pipe_info[pipe_index as usize].0 = false;
+            debug!("Pipe Continue: {}", pipe_index);
+            self.channel_buffers[pipe_index as usize].interrupt_interval.2 = false;
         }
 
         fn create_interrupt_pipe(
@@ -1215,20 +1386,37 @@ pub mod usbhost {
             size: u16,
             interval: u8,
         ) -> Option<InterruptPipe> {
-            debug!("Creating new interrupt pipe {}", size);
             let pipe = self.alloc_channel(size)?;
+            debug!("Creating new interrupt pipe {} pipe_id={}, ep={}", size, pipe.bus_ref as u8, endpoint_number);
+            const MAX_PACKET_SIZE: u16 = 8; // TODO: do based on speed
             self.regs.hcchar(pipe.bus_ref.into()).write(|w| {
                 w.set_eptyp(Eptyp::INTERRUPT);
                 w.set_epnum(endpoint_number);
-                w.set_epdir(direction as u8 == 1);
+                w.set_epdir(direction as u8 == 0x80);
                 w.set_dad(device_address.into());
+                w.set_chena(false);
+                w.set_mpsiz(MAX_PACKET_SIZE);
+                // TODO: here also ls-via-fs-hub setting
             });
 
             self.regs.hctsiz(pipe.bus_ref.into()).modify(|w| {
-                w.set_dpid(0); // Initial PID is 0
+                w.set_dpid(Dpid::DATA0 as u8); // Initial PID is 0
                 w.set_doping(false); // Don't ping
-                w.set_schedinfo(0xFF);
-                w.set_ntdl(0);
+                w.set_pktcnt(size.div_ceil(MAX_PACKET_SIZE).max(1) as u16);
+                #[cfg(feature = "usbh-sg")]
+                {
+                    w.set_schedinfo(0xFF);
+                    w.set_ntdl(0);
+                }
+                #[cfg(not(feature = "usbh-sg"))]
+                w.set_xfrsiz(
+                    match direction {
+                        usbh::UsbDirection::In => w.pktcnt() as u32  * MAX_PACKET_SIZE as u32,
+                        usbh::UsbDirection::Out => size as u32
+                    });
+            });
+            self.regs.hcintmsk(pipe.bus_ref.into()).write(|w| {
+                w.0 = 0x7ff; // Enable all
             });
 
             // [XINU]:
@@ -1240,15 +1428,32 @@ pub mod usbhost {
             //  * second, then it will, unfortunately, be polled 100 times per second in
             //  * software. 
 
-            // ESP-IDF disagress and does use a hardware scheduler (as found in hcfg: https://github.com/espressif/esp-idf/blob/d7ca8b94c852052e3bc33292287ef4dd62c9eeb1/components/soc/esp32s2/include/soc/usb_dwc_struct.h#L377-L378)
+            // ESP-IDF disagrees and does use a hardware scheduler (as found in hcfg: https://github.com/espressif/esp-idf/blob/d7ca8b94c852052e3bc33292287ef4dd62c9eeb1/components/soc/esp32s2/include/soc/usb_dwc_struct.h#L377-L378)
             // However the calc seems complex: https://github.com/espressif/esp-idf/blob/d7ca8b94c852052e3bc33292287ef4dd62c9eeb1/components/hal/usb_dwc_hal.c#L338
+            // Xilinx-linux seems to corroborate NTD is only for descriptor-dma, xinu was right :( https://github.com/Xilinx/linux-xlnx/blob/master/drivers/usb/dwc2/hcd_ddma.c
+            // Unfortunately our new documentation gold-mine has confirmed perschedena is dead: 
+            // > Enable Periodic Scheduling (PerSchedEna):
+            // > Applicable in host DDMA mode only.
+            // > Frame List Entries(FrListEn). [...,]
+            // > This field is valid only in Scatter/Gather DMA mode.
             
-            self.regs.hcfg().write(|w| {
-                w.set_frlistlen(FRAME_LIST_LEN);
-                w.set_perschedena(true);
-            });
-            // NOTE: interval incoming is in ms-1, while interval for dwc2 is specified in frames
-            // This will be handled in poll()
+            #[cfg(feature = "usbh-sg")]
+            {
+                let hfcg = self.regs.hcfg().read();
+                if !hfcg.perschedena() {
+                    debug!("Configuring intial framelist");
+                    // Don't initialize frame list if already enabled
+                    self.regs.hflbaddr().write(|w| {
+                        w.set_hflbaddr(self.buffers.frame_list.as_ptr() as u32);
+                    });
+                    self.regs.hcfg().modify(|w| {
+                        w.set_frlistlen(FRAME_LIST_LEN);
+                        w.set_perschedena(true);
+                    });
+                }
+                // NOTE: interval incoming is in ms-1, while interval for dwc2 is specified in frames
+                // This will be handled in poll()
+            }
             self.set_frameschedule(pipe.bus_ref, interval, 0);
             Some(pipe)
         }
@@ -1295,18 +1500,19 @@ pub mod usbhost {
 
             #[cfg(feature = "usbh-fifo")]
             {
+                todo!("Move to the polls")
                 // FIXME: this should be moved to poll() since we don't have a mutable reference here
-                assert!(length < self.rxfifo_buf.len());
+                // assert!(length <= self.rxfifo_buf.len());
 
-                // Ceil length/4 to include partial bytes in last fifo read
-                let fifo_len = length.div_ceil(4) * 4;
+                // // Ceil length/4 to include partial bytes in last fifo read
+                // let fifo_len = length.div_ceil(4) * 4;
                 
-                for i in (0..fifo_len).step_by(4) {
-                    // According to TinyUSB rx should be fifo0, need to if check tx correct
-                    self.rxfifo_buf[i..i+4].copy_from_slice(&self.regs.fifo(0).read().0.to_ne_bytes())
-                }
+                // for i in (0..fifo_len).step_by(4) {
+                //     // According to TinyUSB rx should be fifo0, need to if check tx correct
+                //     self.rxfifo_buf[i..i+4].copy_from_slice(&self.regs.fifo(0).read().0.to_ne_bytes())
+                // }
 
-                &self.rxfifo_buf[..length]
+                // &self.rxfifo_buf[..length]
             }
         }
     }
