@@ -1526,6 +1526,8 @@ pub mod asynch {
         EndpointType,
         Event,
         Unsupported,
+        Bus as _Bus,
+        Driver as _Driver
     };
     pub use embassy_usb_synopsys_otg::Config;
     use embassy_usb_synopsys_otg::{
