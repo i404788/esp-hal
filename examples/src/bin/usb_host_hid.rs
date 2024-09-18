@@ -20,7 +20,7 @@ use esp_hal::{
     peripherals::Peripherals,
     prelude::*,
     system::SystemControl,
-    cpu_control::{CpuControl},
+    cpu_control::CpuControl,
     clock::{ClockControl, CpuClock},
 };
 use esp_println::println;
@@ -50,8 +50,6 @@ fn main() -> ! {
     let peripherals = Peripherals::take();
     let system = SystemControl::new(peripherals.SYSTEM);
     let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
-    
-
     
     esp_println::logger::init_logger(log::LevelFilter::Debug);
 

@@ -135,10 +135,9 @@ unsafe impl<'d> UsbPeripheral for Usb<'d> {
 pub mod usbhost {
     extern crate alloc;
 
-    use core::ops::Mul;
-
     use embassy_usb_synopsys_otg::
-        otg_v1::{vals::{Dpid, Dspd, Eptyp, FrameListLen, Pfivl}, Otg}
+        otg_v1::{vals::{Dpid, Dspd, Eptyp, FrameListLen, Pfivl}, Otg,
+    }
     ;
     use procmacros::handler;
     use usbh::{bus::{Error, Event, HostBus, InterruptPipe}, types::ConnectionSpeed};
@@ -1518,16 +1517,14 @@ pub mod usbhost {
     }
 }
 
-#[cfg(feature = "async")]
+#[cfg(all(feature = "async", not(feature = "usb-host")))]
 pub mod asynch {
     use embassy_usb_driver::{
         EndpointAddress,
         EndpointAllocError,
         EndpointType,
         Event,
-        Unsupported,
-        Bus as _Bus,
-        Driver as _Driver
+        Unsupported
     };
     pub use embassy_usb_synopsys_otg::Config;
     use embassy_usb_synopsys_otg::{
@@ -1599,7 +1596,7 @@ pub mod asynch {
         type EndpointOut = Endpoint<'d, Out>;
         type EndpointIn = Endpoint<'d, In>;
         type ControlPipe = ControlPipe<'d>;
-        type Bus = Bus<'d>;
+        type Bus = DeviceBus<'d>;
 
         fn alloc_endpoint_in(
             &mut self,
@@ -1625,7 +1622,7 @@ pub mod asynch {
             let (bus, cp) = self.inner.start(control_max_packet_size);
 
             (
-                Bus {
+                Self::Bus {
                     inner: bus,
                     inited: false,
                 },
@@ -1636,12 +1633,12 @@ pub mod asynch {
 
     /// Asynchronous USB bus mainly used internally by `embassy-usb`.
     // We need a custom wrapper implementation to handle custom initialization.
-    pub struct Bus<'d> {
+    pub struct DeviceBus<'d> {
         inner: OtgBus<'d, MAX_EP_COUNT>,
         inited: bool,
     }
 
-    impl<'d> Bus<'d> {
+    impl<'d> DeviceBus<'d> {
         fn init(&mut self) {
             Usb::_enable();
 
@@ -1692,7 +1689,7 @@ pub mod asynch {
         }
     }
 
-    impl<'d> embassy_usb_driver::Bus for Bus<'d> {
+    impl<'d> embassy_usb_driver::Bus for DeviceBus<'d> {
         async fn poll(&mut self) -> Event {
             if !self.inited {
                 self.init();
@@ -1727,9 +1724,9 @@ pub mod asynch {
         }
     }
 
-    impl<'d> Drop for Bus<'d> {
+    impl<'d> Drop for DeviceBus<'d> {
         fn drop(&mut self) {
-            Bus::disable(self);
+            DeviceBus::disable(self);
         }
     }
 

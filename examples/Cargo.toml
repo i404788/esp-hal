@@ -13,12 +13,18 @@ cfg-if              = "1.0.0"
 critical-section    = "1.1.2"
 crypto-bigint       = { version = "0.5.5", default-features = false }
 elliptic-curve      = { version = "0.13.8", default-features = false, features = ["sec1"] }
-embassy-executor    = { version = "0.5.0", features = ["task-arena-size-40960"] }
-embassy-futures     = "0.1.1"
-embassy-net = { version = "0.4.0", features = [ "tcp", "udp", "dhcpv4", "medium-ethernet"] }
-embassy-sync        = "0.6.0"
-embassy-time        = "0.3.1"
-embassy-time-driver = { version = "0.1.0", optional = true }
+embassy-futures = { git = "https://github.com/i404788/embassy.git", rev = "2f46ed5", optional = true}
+embassy-sync = { git = "https://github.com/i404788/embassy.git", rev = "2f46ed5", optional = true}
+embassy-executor    = { git = "https://github.com/i404788/embassy.git", rev = "2f46ed5", features = ["task-arena-size-40960"] }
+embassy-time-driver = { git = "https://github.com/i404788/embassy.git", rev = "2f46ed5", optional = true}
+embassy-time = { git = "https://github.com/i404788/embassy.git", rev = "2f46ed5"}
+embassy-net = { git = "https://github.com/i404788/embassy.git", rev = "2f46ed5", features = [ "tcp", "udp", "dhcpv4", "medium-ethernet"] }
+# embassy-executor    = { version = "0.5.0", features = ["task-arena-size-40960"] }
+# embassy-futures     = "0.1.1"
+# embassy-net = { version = "0.4.0", features = [ "tcp", "udp", "dhcpv4", "medium-ethernet"] }
+# embassy-sync        = "0.6.0"
+# embassy-time        = "0.3.1"
+# embassy-time-driver = { version = "0.1.0", optional = true }
 embassy-usb         = { version = "0.2.0", default-features = false, optional = true }
 embedded-can        = "0.4.1"
 embedded-graphics   = "0.8.1"
