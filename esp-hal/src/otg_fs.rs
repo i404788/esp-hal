@@ -141,6 +141,7 @@ pub mod asynch {
     pub use embassy_usb_synopsys_otg::Config;
     use embassy_usb_synopsys_otg::{
         on_interrupt,
+        host::UsbHostBus,
         otg_v1::Otg,
         Bus as OtgBus,
         ControlPipe,
@@ -156,6 +157,127 @@ pub mod asynch {
 
     use super::*;
     use crate::Cpu;
+
+
+    /// Usb-host functionality
+    #[cfg(feature = "usb-host")]
+    pub mod host {
+        use embassy_usb_synopsys_otg::{
+                host::UsbHostBus,
+                otg_v1::Otg,
+            };
+        use super::{Peripheral, PeripheralRef, Internal, InputSignal, peripherals, Cpu, PeripheralEnable, PeripheralClockControl, UsbDm, UsbDp, Usb, handler, UsbPeripheral};
+
+        #[handler(priority = crate::interrupt::Priority::max())]
+        fn interrupt_handler() {
+            poll_usbhost()
+        }
+
+        /// Will update the usbhost state & wakers (typically called by interrupt)
+        #[inline]
+        pub fn poll_usbhost() {
+            unsafe {
+                UsbHostBus::on_interrupt_or_poll(
+                    Otg::from_ptr(Usb::REGISTERS.cast_mut())
+                )
+            }
+        }
+
+
+        /// UsbHost
+        pub struct UsbHost<'d> {
+            regs: Otg,
+            // TODO: should we proxy it for convience?
+            /// The actual embassy-usb bus
+            pub bus: UsbHostBus,
+            _usb0: PeripheralRef<'d, peripherals::USB0>,
+
+        }
+
+        impl<'d> UsbHost<'d> {
+            /// Initializes the USB peripheral to be a Host 
+            /// And exposes a embassy-usb::UsbHostBus
+            pub fn new<P, M>(
+                usb0: impl Peripheral<P = peripherals::USB0> + 'd,
+                _usb_dp: impl Peripheral<P = P> + 'd,
+                _usb_dm: impl Peripheral<P = M> + 'd,
+            ) -> Self
+            where
+                P: UsbDp + Send + Sync,
+                M: UsbDm + Send + Sync,
+            {
+                PeripheralClockControl::reset(PeripheralEnable::Usb);
+                PeripheralClockControl::enable(PeripheralEnable::Usb);
+
+                unsafe {
+                    let usb_wrap = &*peripherals::USB_WRAP::PTR;
+                    usb_wrap.otg_conf().modify(|_, w| {
+                        w.usb_pad_enable().set_bit()
+                            .phy_sel().clear_bit()
+                            .clk_en().set_bit()
+                            .ahb_clk_force_on().set_bit()
+                            .phy_clk_force_on().set_bit()
+                            .pad_pull_override().set_bit()
+                            .dp_pulldown().set_bit()
+                            .dm_pulldown().set_bit()
+                            .dp_pullup().clear_bit()
+                            .dm_pullup().clear_bit()
+                    });
+    
+                    #[cfg(esp32s3)]
+                    {
+                        let rtc = &*peripherals::LPWR::PTR;
+                        rtc.usb_conf()
+                            .modify(|_, w| 
+                                w.sw_hw_usb_phy_sel().set_bit()
+                                 .sw_usb_phy_sel().set_bit());
+                    }
+
+                    use crate::gpio::Level;
+                    Level::Low.connect_input_to_peripheral(InputSignal::USB_SRP_BVALID, Internal); // HIGH to force USB device mode
+                    Level::Low.connect_input_to_peripheral(InputSignal::USB_OTG_IDDIG, Internal); // Indicate A-Device by floating the ID pin
+                    Level::High.connect_input_to_peripheral(InputSignal::USB_OTG_VBUSVALID, Internal);
+                    Level::High.connect_input_to_peripheral(InputSignal::USB_OTG_AVALID, Internal); // Assume valid A device
+                }
+
+
+                let regs: Otg = unsafe { Otg::from_ptr(Usb::REGISTERS.cast_mut()) };
+
+                let bus = UsbHostBus::new(regs);
+                // debug!("Core ID {}", regs.cid().read().product_id());
+
+                unsafe {
+                    crate::interrupt::bind_interrupt(
+                        crate::peripherals::Interrupt::USB,
+                        interrupt_handler.handler(),
+                    );
+                    crate::interrupt::enable(
+                        crate::peripherals::Interrupt::USB,
+                        interrupt_handler.priority(),
+                    )
+                    .unwrap();
+                }
+
+
+                let res = Self {
+                    _usb0: usb0.into_ref(),
+                    bus,
+                    regs,
+                };
+
+                res
+            }
+        }
+
+        impl<'d> Drop for UsbHost<'d> {
+            fn drop(&mut self) {
+                crate::interrupt::disable(Cpu::ProCpu, crate::peripherals::Interrupt::USB);
+
+                #[cfg(multi_core)]
+                crate::interrupt::disable(Cpu::AppCpu, crate::peripherals::Interrupt::USB);
+            }
+        }
+    }
 
     // From ESP32-S3 TRM:
     // Six additional endpoints (endpoint numbers 1 to 6), configurable as IN or OUT
