@@ -89,8 +89,8 @@ async fn main(spawner: Spawner) {
     println!("Found device with speed = {:?}", speed);
 
     let enum_info = usbhost.bus.enumerate_root(speed, 1).await.unwrap();
+    Timer::after_micros(20).await;
     let mut kbd = KbdHandler::try_register(&usbhost.bus, enum_info).await.expect("Couldn't register keyboard");
-
     loop {
         let result = kbd.wait_for_event().await;
         debug!("{}", result);
