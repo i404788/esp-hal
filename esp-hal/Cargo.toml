@@ -29,10 +29,10 @@ document-features        = "0.2.10"
 # embassy-sync             = "0.6.0"
 # embassy-usb-driver       = { version = "0.1.0", optional = true }
 # embassy-usb-synopsys-otg = { version = "0.1.0", optional = true }
-embassy-sync = { git = "https://github.com/i404788/embassy.git", rev = "df729bf"}
-embassy-futures = { git = "https://github.com/i404788/embassy.git", rev = "df729bf"}
-embassy-usb-driver = { git = "https://github.com/i404788/embassy.git", rev = "df729bf", optional = true}
-embassy-usb-synopsys-otg = { git = "https://github.com/i404788/embassy.git", rev = "df729bf", optional = true}
+embassy-sync = { git = "https://github.com/i404788/embassy.git", branch = "usb-asynch"}
+embassy-futures = { git = "https://github.com/i404788/embassy.git", branch = "usb-asynch"}
+embassy-usb-driver = { git = "https://github.com/i404788/embassy.git", branch = "usb-asynch", optional = true}
+embassy-usb-synopsys-otg = { git = "https://github.com/i404788/embassy.git", branch = "usb-asynch", optional = true}
 embedded-can             = "0.4.1"
 embedded-hal-02          = { version = "0.2.7", features = ["unproven"], package = "embedded-hal" }
 embedded-hal             = "1.0.0"
