@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `{DmaRxBuf, DmaTxBuf, DmaRxTxBuf}::set_burst_config` (#2543)
 - Added `SpiDmaBus::split` for moving between manual & automatic DMA buffers (#2824)
 - Added `SpiDmaBus::deconstruct` for moving between manual & automatic DMA buffers (#2823)
+- Added `SpiDmaBus::deconstruct` for moving between manual & automatic DMA buffers (#2824)
 - ESP32-S2: DMA support for AES (#2699)
 - Added `transfer_in_place_async` and embedded-hal-async implementation to `Spi` (#2691)
 - `InterruptHandler` now implements `Hash` and `defmt::Format` (#2830)
