@@ -1089,9 +1089,11 @@ mod dma {
 
         fn is_done(&self) -> bool {
             if self.tx_transfer_in_progress && !self.channel.tx.is_done() {
+                debug!("tx busy");
                 return false;
             }
             if self.driver().busy() {
+                debug!("driver busy");
                 return false;
             }
             if self.rx_transfer_in_progress {
@@ -1103,6 +1105,7 @@ mod dma {
                 // discarded the rest. The user doesn't care about this discarded data.
 
                 if !self.channel.rx.is_done() && !self.channel.rx.has_dscr_empty_error() {
+                    debug!("rx busy");
                     return false;
                 }
             }
