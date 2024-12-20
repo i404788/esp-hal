@@ -1063,6 +1063,7 @@ mod dma {
 
         fn is_done(&self) -> bool {
             if self.tx_transfer_in_progress && !self.channel.tx.is_done() {
+                assert!(!self.channel.tx.has_error(), "Got DMA descriptor error while waiting for completion");
                 debug!("tx busy");
                 return false;
             }
@@ -1079,6 +1080,7 @@ mod dma {
                 // discarded the rest. The user doesn't care about this discarded data.
 
                 if !self.channel.rx.is_done() && !self.channel.rx.has_dscr_empty_error() {
+                    assert!(!self.channel.tx.has_error(), "Got DMA descriptor error while waiting for completion");
                     debug!("rx busy");
                     return false;
                 }
