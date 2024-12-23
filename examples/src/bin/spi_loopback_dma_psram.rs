@@ -16,7 +16,7 @@
 //! If your module is quad PSRAM then you need to change the `psram` feature in the
 //! in the features line below to `quad-psram`.
 
-//% FEATURES: esp-hal/log esp-hal/octal-psram esp-hal/unstable
+//% FEATURES: esp-hal/log esp-hal/quad-psram esp-hal/unstable
 //% CHIPS: esp32s3
 
 #![no_std]
@@ -57,7 +57,7 @@ const DMA_CHUNK_SIZE: usize = 4096 - DMA_ALIGNMENT as usize;
 
 #[entry]
 fn main() -> ! {
-    esp_println::logger::init_logger(log::LevelFilter::Info);
+    esp_println::logger::init_logger(log::LevelFilter::Debug);
     info!("Starting SPI loopback test");
     let peripherals = esp_hal::init(esp_hal::Config::default());
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
@@ -78,17 +78,10 @@ fn main() -> ! {
         tx_descriptors.len()
     );
     let mut dma_tx_buf =
-        DmaTxBuf::new_with_config(tx_descriptors, tx_buffer, DMA_ALIGNMENT).unwrap();
-    let (rx_buffer, rx_descriptors, _, _) = esp_hal::dma_buffers!(DMA_BUFFER_SIZE, 0);
-    info!(
-        "RX: {:p} len {} ({} descripters)",
-        rx_buffer.as_ptr(),
-        rx_buffer.len(),
-        rx_descriptors.len()
-    );
-    let mut dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
-    // Need to set miso first so that mosi can overwrite the
-    // output connection (because we are using the same pin to loop back)
+        Some(DmaTxBuf::new_with_config(tx_descriptors, tx_buffer, DMA_ALIGNMENT).unwrap());
+
+    log::info!("First dmabuffer: {:?}", dma_tx_buf.as_mut());
+
     let mut spi = Spi::new(
         peripherals.SPI2,
         Config::default()
@@ -104,40 +97,25 @@ fn main() -> ! {
 
     delay.delay_millis(100); // delay to let the above messages display
 
-    for (i, v) in dma_tx_buf.as_mut_slice().iter_mut().enumerate() {
+    for (i, v) in dma_tx_buf
+        .as_mut()
+        .unwrap()
+        .as_mut_slice()
+        .iter_mut()
+        .enumerate()
+    {
         *v = (i % 256) as u8;
     }
 
     let mut i = 0;
 
     loop {
-        dma_tx_buf.as_mut_slice()[0] = i;
-        *dma_tx_buf.as_mut_slice().last_mut().unwrap() = i;
-        i = i.wrapping_add(1);
+        let mut dma_buf = dma_tx_buf.take().unwrap();
+        let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
 
-        let transfer = spi
-            .transfer(dma_rx_buf.len(), dma_rx_buf, dma_tx_buf.len(), dma_tx_buf)
-            .map_err(|e| e.0)
-            .unwrap();
+        (spi, dma_buf) = transfer.wait();
+        dma_tx_buf.replace(dma_buf);
 
-        (spi, (dma_rx_buf, dma_tx_buf)) = transfer.wait();
-        for (i, v) in dma_tx_buf.as_mut_slice().iter_mut().enumerate() {
-            if dma_rx_buf.as_slice()[i] != *v {
-                error!(
-                    "Mismatch at index {}: expected {}, got {}",
-                    i,
-                    *v,
-                    dma_rx_buf.as_slice()[i]
-                );
-                break;
-            }
-        }
-        info!(
-            "{:0x?} .. {:0x?}",
-            &dma_rx_buf.as_slice()[..10],
-            &dma_rx_buf.as_slice().last_chunk::<10>().unwrap()
-        );
-        dma_tx_buf.as_mut_slice().reverse();
         delay.delay_millis(1000);
     }
 }

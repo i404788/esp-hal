@@ -1093,7 +1093,7 @@ mod dma {
                 assert!(!self.channel.tx.has_error(), "Got DMA descriptor error while waiting for completion");
                 // debug!("tx busy, intrs:");
                 for pend in self.channel.tx.pending_out_interrupts().iter() {
-                    debug!("Intr: {}", pend);
+                    debug!("Intr: {:?}", pend);
                 }
                 return false;
             }
