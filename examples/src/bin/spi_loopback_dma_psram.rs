@@ -136,13 +136,13 @@ fn main() -> ! {
         // let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
         // delay.delay_micros(593);
         log::info!("pre-SPI2: {}", unsafe {
-            *(SPI2::ptr().add(0x003C) as *const u32)
+            core::ptr::read_volatile(SPI2::ptr().add(0x003C) as *const u32)
         });
 
-        delay.delay_millis(1000);
+        delay.delay_millis(2000);
 
         log::info!("post-SPI2: {}", unsafe {
-            *(SPI2::ptr().add(0x003C) as *const u32)
+            core::ptr::read_volatile(SPI2::ptr().add(0x003C) as *const u32)
         });
         (spi, dma_buf) = transfer.wait();
         dma_tx_buf.replace(dma_buf);
