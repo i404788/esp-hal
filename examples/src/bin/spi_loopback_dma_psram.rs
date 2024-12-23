@@ -23,6 +23,7 @@
 #![no_main]
 
 use esp_backtrace as _;
+use esp_hal::peripherals::SPI2;
 use esp_hal::{
     delay::Delay,
     dma::{DmaRxBuf, DmaTxBuf, ExternalBurstConfig},
@@ -133,7 +134,12 @@ fn main() -> ! {
             )
             .unwrap();
         // let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
+        delay.delay_micros(593);
+        // delay.delay_millis(1);
 
+        log::info!("SPI2: {}", unsafe {
+            *(SPI2::ptr().add(0x0040) as *const u32).as_ref().unwrap()
+        });
         (spi, dma_buf) = transfer.wait();
         dma_tx_buf.replace(dma_buf);
 
