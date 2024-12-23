@@ -134,11 +134,15 @@ fn main() -> ! {
             )
             .unwrap();
         // let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
-        delay.delay_micros(593);
-        // delay.delay_millis(1);
+        // delay.delay_micros(593);
+        log::info!("pre-SPI2: {}", unsafe {
+            *(SPI2::ptr().add(0x003C) as *const u32)
+        });
 
-        log::info!("SPI2: {}", unsafe {
-            *(SPI2::ptr().add(0x0040) as *const u32).as_ref().unwrap()
+        delay.delay_millis(1000);
+
+        log::info!("post-SPI2: {}", unsafe {
+            *(SPI2::ptr().add(0x003C) as *const u32)
         });
         (spi, dma_buf) = transfer.wait();
         dma_tx_buf.replace(dma_buf);
