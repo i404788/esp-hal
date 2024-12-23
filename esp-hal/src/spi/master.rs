@@ -1091,7 +1091,7 @@ mod dma {
         fn is_done(&self) -> bool {
             if self.tx_transfer_in_progress && !self.channel.tx.is_done() {
                 assert!(!self.channel.tx.has_error(), "Got DMA descriptor error while waiting for completion");
-                debug!("tx busy, intrs:");
+                // debug!("tx busy, intrs:");
                 for pend in self.channel.tx.pending_out_interrupts().iter() {
                     debug!("Intr: {}", pend);
                 }
