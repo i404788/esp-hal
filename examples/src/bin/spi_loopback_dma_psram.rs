@@ -67,6 +67,8 @@ fn main() -> ! {
     let mosi = peripherals.GPIO48;
     let miso = unsafe { mosi.clone_unchecked() };
     let cs = peripherals.GPIO38;
+    let sio2 = peripherals.GPIO7;
+    let sio3 = peripherals.GPIO6;
 
     let (_, tx_descriptors) =
         esp_hal::dma_descriptors_chunk_size!(0, DMA_BUFFER_SIZE, DMA_CHUNK_SIZE);
@@ -82,16 +84,24 @@ fn main() -> ! {
 
     log::info!("First dmabuffer: {:?}", dma_tx_buf.as_mut());
 
+    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
+        esp_hal::dma_buffers!(DMA_BUFFER_SIZE);
+
+    let dma_rx_buf2 = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
+    let mut dma_tx_buf2 = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+
     let mut spi = Spi::new(
         peripherals.SPI2,
         Config::default()
-            .with_frequency(100.kHz())
+            .with_frequency(25.MHz())
             .with_mode(Mode::Mode0),
     )
     .unwrap()
     .with_sck(sclk)
     .with_miso(miso)
     .with_mosi(mosi)
+    .with_sio2(sio2)
+    .with_sio3(sio3)
     .with_cs(cs)
     .with_dma(peripherals.DMA_CH0);
 
@@ -110,11 +120,24 @@ fn main() -> ! {
     let mut i = 0;
 
     loop {
+        use esp_hal::spi::master::{Address, Command};
         let mut dma_buf = dma_tx_buf.take().unwrap();
-        let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
+        let transfer = spi
+            .half_duplex_write(
+                esp_hal::spi::DataMode::Quad,
+                Command::None,
+                Address::Address24(0, esp_hal::spi::DataMode::Quad),
+                0u8,
+                dma_buf.len(),
+                dma_buf,
+            )
+            .unwrap();
+        // let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
 
         (spi, dma_buf) = transfer.wait();
         dma_tx_buf.replace(dma_buf);
+
+        log::info!("Done");
 
         delay.delay_millis(1000);
     }
