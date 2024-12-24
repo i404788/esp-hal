@@ -21,8 +21,10 @@
 
 #![no_std]
 #![no_main]
+#![feature(vec_push_within_capacity)]
 
 use esp_backtrace as _;
+use esp_hal::macros::ram;
 use esp_hal::peripherals::SPI2;
 use esp_hal::{
     delay::Delay,
@@ -52,14 +54,47 @@ macro_rules! dma_alloc_buffer {
     }};
 }
 
-const DMA_BUFFER_SIZE: usize = 8192;
 const DMA_ALIGNMENT: ExternalBurstConfig = ExternalBurstConfig::Size64;
 const DMA_CHUNK_SIZE: usize = 4096 - DMA_ALIGNMENT as usize;
+const DMA_BUFFER_SIZE: usize = 8192;
+
+// #[ram]
+fn effectively_empty(fail: bool) // -> bool
+{
+    const size: usize = 2;
+    let mut x: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(size);
+    // unsafe { x.set_len(size) };
+
+    // let layout = core::alloc::Layout::new::<[usize; size]>();
+    // let ptr = unsafe { alloc::alloc::alloc(layout) as *mut usize };
+    // let mut lsize = 0;
+
+    if fail {
+        // for i in 0..size {
+        //     // unsafe { *(ptr.add(i)) = i }
+        //     unsafe { core::ptr::write(ptr.add(i), i) };
+        //     let j = unsafe { *(ptr.add(i)) };
+        //     lsize += j;
+        // }
+        for i in 0..size {
+            // ram op
+            // x.push(i);
+            x.push_within_capacity(i);
+            // x.get(i).unwrap_or(&0);
+        }
+    } else {
+        for i in 0..size {
+            // nop
+            unsafe { core::ptr::read_volatile(SPI2::ptr().add(0x003C) as *const u32) };
+        }
+    }
+
+    // x[size - 2] % 2 == 0
+}
 
 #[entry]
-#[ram]
 fn main() -> ! {
-    esp_println::logger::init_logger(log::LevelFilter::Debug);
+    esp_println::logger::init_logger(log::LevelFilter::Trace);
     info!("Starting SPI loopback test");
     let peripherals = esp_hal::init(esp_hal::Config::default());
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
@@ -84,7 +119,11 @@ fn main() -> ! {
     let mut dma_tx_buf =
         Some(DmaTxBuf::new_with_config(tx_descriptors, tx_buffer, DMA_ALIGNMENT).unwrap());
 
-    log::info!("First dmabuffer: {:?}", dma_tx_buf.as_mut());
+    log::info!(
+        "Alignment: {}, Chunk size: {}",
+        ExternalBurstConfig::Size64 as usize,
+        DMA_CHUNK_SIZE
+    );
 
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
         esp_hal::dma_buffers!(DMA_BUFFER_SIZE);
@@ -119,6 +158,8 @@ fn main() -> ! {
         *v = (i % 256) as u8;
     }
 
+    log::info!("First dmabuffer: {:?}", dma_tx_buf.as_mut());
+
     let mut i = 0;
 
     loop {
@@ -134,12 +175,17 @@ fn main() -> ! {
                 dma_buf,
             )
             .unwrap();
+        // delay.delay_micros(1000);
+        // delay.delay_micros(1000);
+        // delay.delay_micros(1000);
         // let transfer = spi.write(dma_buf.len(), dma_buf).unwrap();
-        delay.delay_micros(593);
-        log::info!("pre-SPI2: {}", unsafe {
-            core::ptr::read_volatile(SPI2::ptr().add(0x003C) as *const u32)
-        });
+        // log::info!("pre-SPI2: {}", unsafe {
+        //     core::ptr::read_volatile(SPI2::ptr().add(0x003C) as *const u32)
+        // });
 
+        core::hint::black_box(effectively_empty(false));
+
+        delay.delay_micros(1000);
         // delay.delay_millis(1000);
 
         log::info!("post-SPI2: {}", unsafe {

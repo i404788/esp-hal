@@ -35,5 +35,9 @@ GATEWAY_IP = "1.1.1.1"
 HOST_IP = "1.1.1.1"
 ESP_WIFI_CSI_ENABLE = "true"
 
+# ESP_HAL_PLACE_SPI_DRIVER_IN_RAM = "true"
+# ESP_HAL_PLACE_ANON_IN_RAM = "true"
+# ESP_HAL_PLACE_SWITCH_TABLES_IN_RAM = "true"
+
 [unstable]
 build-std = ["alloc", "core"]

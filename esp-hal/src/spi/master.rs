@@ -3199,6 +3199,7 @@ impl Driver {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(place_spi_driver_in_ram, ram)]
     fn setup_half_duplex(
         &self,
         is_write: bool,
@@ -3294,6 +3295,7 @@ impl Driver {
                 while reg_block.cmd().read().update().bit_is_set() {
                     // wait
                 }
+                xtensa_lx::timer::delay(100);
             } else if #[cfg(esp32)] {
                 xtensa_lx::timer::delay(1);
             } else {

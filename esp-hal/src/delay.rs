@@ -26,11 +26,12 @@
 //! delay.delay_ms(1000 as u32);
 //! # }
 //! ```
-//! 
+//!
 //! [DelayNs]: https://docs.rs/embedded-hal/1.0.0/embedded_hal/delay/trait.DelayNs.html
 //! [embedded-hal]: https://docs.rs/embedded-hal/1.0.0/embedded_hal/delay/index.html
 //! [now]: crate::time::now
 
+use crate::macros::ram;
 pub use fugit::MicrosDurationU64;
 
 /// Delay driver
@@ -54,6 +55,7 @@ impl Delay {
     }
 
     /// Delay for the specified time
+    #[ram]
     pub fn delay(&self, delay: MicrosDurationU64) {
         let start = crate::time::now();
 
@@ -68,6 +70,7 @@ impl Delay {
     }
 
     /// Delay for the specified number of microseconds
+    #[ram]
     pub fn delay_micros(&self, us: u32) {
         let delay = MicrosDurationU64::micros(us as u64);
         self.delay(delay);

@@ -38,7 +38,7 @@
 //! .with_dma(dma_channel);
 //! # }
 //! ```
-//! 
+//!
 //! ⚠️ Note: Descriptors should be sized as `(max_transfer_size + CHUNK_SIZE - 1) / CHUNK_SIZE`.
 //! I.e., to transfer buffers of size `1..=CHUNK_SIZE`, you need 1 descriptor.
 //!
@@ -62,14 +62,11 @@ pub use self::m2m::*;
 pub use self::pdma::*;
 use crate::{
     interrupt::InterruptHandler,
+    macros::ram,
     peripheral::{Peripheral, PeripheralRef},
     peripherals::Interrupt,
     soc::{is_slice_in_dram, is_valid_memory_address, is_valid_ram_address},
-    system,
-    Async,
-    Blocking,
-    Cpu,
-    DriverMode,
+    system, Async, Blocking, Cpu, DriverMode,
 };
 
 trait Word: crate::private::Sealed {}
@@ -878,33 +875,33 @@ pub enum DmaPriority {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[doc(hidden)]
 pub enum DmaPeripheral {
-    Spi2      = 0,
+    Spi2 = 0,
     #[cfg(any(pdma, esp32s3))]
-    Spi3      = 1,
+    Spi3 = 1,
     #[cfg(any(esp32c2, esp32c6, esp32h2))]
-    Mem2Mem1  = 1,
+    Mem2Mem1 = 1,
     #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s3))]
-    Uhci0     = 2,
+    Uhci0 = 2,
     #[cfg(any(esp32, esp32s2, esp32c3, esp32c6, esp32h2, esp32s3))]
-    I2s0      = 3,
+    I2s0 = 3,
     #[cfg(any(esp32, esp32s3))]
-    I2s1      = 4,
+    I2s1 = 4,
     #[cfg(any(esp32c6, esp32h2))]
-    Mem2Mem4  = 4,
+    Mem2Mem4 = 4,
     #[cfg(esp32s3)]
-    LcdCam    = 5,
+    LcdCam = 5,
     #[cfg(any(esp32c6, esp32h2))]
-    Mem2Mem5  = 5,
+    Mem2Mem5 = 5,
     #[cfg(not(esp32c2))]
-    Aes       = 6,
+    Aes = 6,
     #[cfg(any(esp32s2, gdma))]
-    Sha       = 7,
+    Sha = 7,
     #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s3))]
-    Adc       = 8,
+    Adc = 8,
     #[cfg(esp32s3)]
-    Rmt       = 9,
+    Rmt = 9,
     #[cfg(parl_io)]
-    ParlIo    = 9,
+    ParlIo = 9,
     #[cfg(any(esp32c6, esp32h2))]
     Mem2Mem10 = 10,
     #[cfg(any(esp32c6, esp32h2))]
@@ -2627,6 +2624,7 @@ where
     }
 
     /// Wait for the transfer to finish.
+    #[ram]
     pub fn wait(self) -> Result<(), DmaError> {
         self.instance.peripheral_wait_dma(false, true);
 
