@@ -2413,6 +2413,11 @@ impl DmaDriver {
         rx: &mut RX,
         tx: &mut TX,
     ) -> Result<(), Error> {
+        if _full_duplex {
+            // Only really needed after a half-duplex call
+            self.driver.setup_full_duplex();
+        }
+        
         #[cfg(esp32s2)]
         {
             // without this a transfer after a write will fail
@@ -3117,6 +3122,59 @@ impl Driver {
         self.start_operation();
         SpiFuture::new(self).await;
     }
+
+    fn setup_full_duplex(&self) {
+        let reg_block = self.regs();
+
+        reg_block.ctrl().modify(|_, w| {
+            w.fcmd_dual().clear_bit();
+            w.fcmd_quad().clear_bit();
+            w.faddr_dual().clear_bit();
+            w.faddr_quad().clear_bit();
+            w.fread_dual().clear_bit();
+            w.fread_quad().clear_bit()
+        });
+
+        reg_block.addr().write(|w| unsafe { w.bits(0) });
+        reg_block.user1().write(|w| unsafe { w.bits(0) });
+        reg_block.user2().write(|w| unsafe { w.bits(0) });
+        
+        reg_block.user().modify(|_, w| {
+            w.fwrite_dual().clear_bit();
+            w.fwrite_quad().clear_bit();
+            
+            w.usr_miso_highpart().clear_bit();
+            w.usr_mosi_highpart().clear_bit();
+            w.doutdin().set_bit();
+            w.usr_miso().set_bit();
+            w.usr_mosi().set_bit();
+            w.cs_hold().set_bit();
+            w.usr_dummy_idle().set_bit();
+            w.usr_addr().clear_bit();
+            w.usr_command().clear_bit()
+        });
+        
+        #[cfg(gdma)]
+        reg_block.clk_gate().modify(|_, w| {
+            w.clk_en().set_bit();
+            w.mst_clk_active().set_bit();
+            w.mst_clk_sel().set_bit()
+        });
+        
+        #[cfg(any(esp32c6, esp32h2))]
+        // use default clock source PLL_F80M_CLK
+        crate::peripherals::PCR::regs()
+            .spi2_clkm_conf()
+            .modify(|_, w| unsafe { w.spi2_clkm_sel().bits(1) });
+
+        #[cfg(not(esp32))]
+        reg_block.misc().write(|w| unsafe { w.bits(0) });
+
+        reg_block.slave().write(|w| unsafe { w.bits(0) });
+
+        self.update();
+    }
+    
 
     #[allow(clippy::too_many_arguments)]
     fn setup_half_duplex(
